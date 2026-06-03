@@ -1,0 +1,488 @@
+import express from 'express';
+import db from '../db.js';
+import PDFDocument from 'pdfkit';
+
+const router = express.Router();
+
+function toNumber(value, fallback = 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizeText(value) {
+    if (value === undefined || value === null) return null;
+    const txt = String(value).trim();
+    return txt.length ? txt : null;
+}
+
+function round2(value) {
+    return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
+async function getNextCreditNoteNo(conn) {
+    const [rows] = await conn.query(
+        "SELECT invoice_no FROM sales_invoices WHERE invoice_no LIKE 'CN-%' ORDER BY id DESC LIMIT 1"
+    );
+    const today = new Date();
+    const y = today.getFullYear();
+    const m = String(today.getMonth() + 1).padStart(2, '0');
+    const d = String(today.getDate()).padStart(2, '0');
+    const prefix = `CN-${y}${m}${d}-`;
+
+    let seq = 1;
+    if (rows.length && String(rows[0].invoice_no || '').startsWith(prefix)) {
+        const n = Number(String(rows[0].invoice_no).slice(prefix.length));
+        if (Number.isFinite(n) && n >= 1) seq = n + 1;
+    }
+
+    return `${prefix}${String(seq).padStart(3, '0')}`;
+}
+
+async function computeLines(conn, inputItems, supplyType) {
+    const errors = [];
+    const normalizedItems = [];
+
+    for (const raw of inputItems) {
+        const itemId = Number(raw.item_id);
+        const qty = toNumber(raw.quantity, 0);
+        const rateInput = raw.rate;
+        const discountPercent = toNumber(raw.discount_percent, 0);
+        const gstPercentInput = raw.gst_percent;
+
+        if (!Number.isFinite(itemId) || itemId <= 0) {
+            errors.push('each line requires valid item_id');
+            continue;
+        }
+        if (!Number.isFinite(qty) || qty <= 0) {
+            errors.push('quantity must be greater than 0');
+            continue;
+        }
+        if (!Number.isInteger(qty)) {
+            errors.push('quantity must be a whole number');
+            continue;
+        }
+
+        const [itemRows] = await conn.query(
+            'SELECT id, name, hsn_code, unit, sale_price, gst_percent FROM items WHERE id = ? LIMIT 1',
+            [itemId]
+        );
+        if (!itemRows.length) {
+            errors.push(`item not found for item_id ${itemId}`);
+            continue;
+        }
+
+        const item = itemRows[0];
+        const rate = toNumber(rateInput, Number(item.sale_price || 0));
+        const gstPercent = toNumber(gstPercentInput, Number(item.gst_percent || 0));
+
+        const lineBase = round2(qty * rate);
+        const discountAmount = round2((lineBase * discountPercent) / 100);
+        const taxable = round2(lineBase - discountAmount);
+        const gstAmount = round2((taxable * gstPercent) / 100);
+
+        let cgst = 0;
+        let sgst = 0;
+        let igst = 0;
+        if (supplyType === 'inter') {
+            igst = gstAmount;
+        } else {
+            cgst = round2(gstAmount / 2);
+            sgst = round2(gstAmount - cgst);
+        }
+
+        normalizedItems.push({
+            item_id: item.id,
+            item_name: item.name,
+            hsn_code: item.hsn_code,
+            quantity: qty,
+            unit: item.unit || 'pcs',
+            rate,
+            discount_percent: discountPercent,
+            discount_amount: discountAmount,
+            taxable_value: taxable,
+            gst_percent: gstPercent,
+            cgst_amount: cgst,
+            sgst_amount: sgst,
+            igst_amount: igst,
+            line_total: round2(taxable + cgst + sgst + igst),
+        });
+    }
+
+    return { normalizedItems, errors };
+}
+
+function summarizeTotals(lines, headerDiscountAmount, roundOff, paidAmount) {
+    const subtotal = round2(lines.reduce((sum, line) => sum + line.quantity * line.rate, 0));
+    const lineDiscountTotal = round2(lines.reduce((sum, line) => sum + line.discount_amount, 0));
+    const taxableAmountBeforeHeader = round2(lines.reduce((sum, line) => sum + line.taxable_value, 0));
+    const taxableAmount = round2(Math.max(0, taxableAmountBeforeHeader - headerDiscountAmount));
+
+    const cgstAmount = round2(lines.reduce((sum, line) => sum + line.cgst_amount, 0));
+    const sgstAmount = round2(lines.reduce((sum, line) => sum + line.sgst_amount, 0));
+    const igstAmount = round2(lines.reduce((sum, line) => sum + line.igst_amount, 0));
+
+    const totalAmount = round2(taxableAmount + cgstAmount + sgstAmount + igstAmount + roundOff);
+    const balanceAmount = round2(Math.max(0, totalAmount - paidAmount));
+
+    return {
+        subtotal,
+        lineDiscountTotal,
+        taxableAmount,
+        cgstAmount,
+        sgstAmount,
+        igstAmount,
+        totalAmount,
+        balanceAmount,
+    };
+}
+
+router.get('/', async (req, res) => {
+    const { q, status } = req.query;
+    const conditions = ["s.invoice_no LIKE 'CN-%'"];
+    const params = [];
+
+    if (q) {
+        const pattern = `%${q}%`;
+        conditions.push('(s.invoice_no LIKE ? OR p.name LIKE ?)');
+        params.push(pattern, pattern);
+    }
+
+    if (status) {
+        conditions.push('s.status = ?');
+        params.push(String(status));
+    }
+
+    const whereSql = `WHERE ${conditions.join(' AND ')}`;
+
+    try {
+        const [rows] = await db.query(
+            `
+            SELECT s.id, s.invoice_no, s.invoice_date, s.due_date, s.total_amount, s.status, s.created_at,
+                   p.id AS party_id, p.name AS party_name
+            FROM sales_invoices s
+            JOIN parties p ON p.id = s.party_id
+            ${whereSql}
+            ORDER BY s.invoice_date DESC, s.id DESC
+            `,
+            params
+        );
+        return res.json(rows);
+    } catch (err) {
+        console.error('Credit note list error:', err);
+        return res.status(500).json({ error: 'Failed to fetch credit notes' });
+    }
+});
+
+router.get('/next-credit-note-no', async (_req, res) => {
+    const conn = await db.getConnection();
+    try {
+        const creditNoteNo = await getNextCreditNoteNo(conn);
+        return res.json({ creditNoteNo });
+    } catch (err) {
+        console.error('Next credit note no error:', err);
+        return res.status(500).json({ error: 'Failed to generate credit note number' });
+    } finally {
+        conn.release();
+    }
+});
+
+router.get('/:id', async (req, res) => {
+    try {
+        const [rows] = await db.query(
+            `
+            SELECT s.*, p.name AS party_name, p.phone AS party_phone, p.gstin AS party_gstin,
+                   p.billing_address AS party_billing_address, p.city AS party_city, p.state AS party_state
+            FROM sales_invoices s
+            JOIN parties p ON p.id = s.party_id
+            WHERE s.id = ? AND s.invoice_no LIKE 'CN-%'
+            LIMIT 1
+            `,
+            [req.params.id]
+        );
+
+        if (!rows.length) {
+            return res.status(404).json({ error: 'Credit note not found' });
+        }
+
+        const [itemRows] = await db.query(
+            `
+            SELECT id, item_id, item_name, hsn_code, quantity, unit, rate,
+                   discount_percent, discount_amount, taxable_value, gst_percent,
+                   cgst_amount, sgst_amount, igst_amount, line_total
+            FROM sales_invoice_items
+            WHERE sales_invoice_id = ?
+            ORDER BY id ASC
+            `,
+            [req.params.id]
+        );
+
+        return res.json({ creditNote: rows[0], items: itemRows });
+    } catch (err) {
+        console.error('Credit note get error:', err);
+        return res.status(500).json({ error: 'Failed to fetch credit note' });
+    }
+});
+
+router.post('/', async (req, res) => {
+    const partyId = Number(req.body.party_id);
+    const invoiceDate = normalizeText(req.body.invoice_date);
+    const dueDate = normalizeText(req.body.due_date);
+    const placeOfSupply = normalizeText(req.body.place_of_supply);
+    const notes = normalizeText(req.body.notes);
+    const status = normalizeText(req.body.status) || 'draft';
+    const headerDiscountAmount = toNumber(req.body.discount_amount, 0);
+    const roundOff = toNumber(req.body.round_off, 0);
+    const supplyType = normalizeText(req.body.supply_type) || 'intra';
+    const inputItems = Array.isArray(req.body.items) ? req.body.items : [];
+
+    const errors = [];
+    if (!Number.isFinite(partyId) || partyId <= 0) errors.push('party_id is required');
+    if (!invoiceDate) errors.push('invoice_date is required');
+    if (!inputItems.length) errors.push('at least one item is required');
+    if (!['intra', 'inter'].includes(supplyType)) errors.push('supply_type must be intra or inter');
+
+    if (errors.length) return res.status(400).json({ error: errors.join(', ') });
+
+    const conn = await db.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [partyRows] = await conn.query('SELECT id FROM parties WHERE id = ? LIMIT 1', [partyId]);
+        if (!partyRows.length) {
+            await conn.rollback();
+            return res.status(400).json({ error: 'party not found' });
+        }
+
+        const creditNoteNo = normalizeText(req.body.credit_note_no) || await getNextCreditNoteNo(conn);
+        const { normalizedItems, errors: lineErrors } = await computeLines(conn, inputItems, supplyType);
+        if (lineErrors.length) {
+            await conn.rollback();
+            return res.status(400).json({ error: lineErrors.join(', ') });
+        }
+
+        const totals = summarizeTotals(normalizedItems, headerDiscountAmount, roundOff, 0);
+
+        const [result] = await conn.query('INSERT INTO sales_invoices SET ?', {
+            invoice_no: creditNoteNo,
+            party_id: partyId,
+            invoice_date: invoiceDate,
+            due_date: dueDate,
+            place_of_supply: placeOfSupply,
+            subtotal: totals.subtotal,
+            discount_amount: round2(totals.lineDiscountTotal + headerDiscountAmount),
+            taxable_amount: totals.taxableAmount,
+            cgst_amount: totals.cgstAmount,
+            sgst_amount: totals.sgstAmount,
+            igst_amount: totals.igstAmount,
+            round_off: roundOff,
+            total_amount: totals.totalAmount,
+            paid_amount: 0,
+            balance_amount: totals.balanceAmount,
+            status,
+            notes,
+        });
+
+        for (const line of normalizedItems) {
+            await conn.query('INSERT INTO sales_invoice_items SET ?', {
+                sales_invoice_id: result.insertId,
+                ...line,
+            });
+        }
+
+        await conn.commit();
+        return res.status(201).json({ success: true, creditNoteId: result.insertId, creditNoteNo });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Credit note create error:', err);
+        if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Credit note number already exists' });
+        return res.status(500).json({ error: 'Failed to create credit note' });
+    } finally {
+        conn.release();
+    }
+});
+
+router.put('/:id', async (req, res) => {
+    const creditNoteId = Number(req.params.id);
+    const partyId = Number(req.body.party_id);
+    const invoiceDate = normalizeText(req.body.invoice_date);
+    const dueDate = normalizeText(req.body.due_date);
+    const placeOfSupply = normalizeText(req.body.place_of_supply);
+    const notes = normalizeText(req.body.notes);
+    const status = normalizeText(req.body.status) || 'draft';
+    const headerDiscountAmount = toNumber(req.body.discount_amount, 0);
+    const roundOff = toNumber(req.body.round_off, 0);
+    const supplyType = normalizeText(req.body.supply_type) || 'intra';
+    const inputItems = Array.isArray(req.body.items) ? req.body.items : [];
+
+    const errors = [];
+    if (!Number.isFinite(creditNoteId) || creditNoteId <= 0) errors.push('valid credit note id is required');
+    if (!Number.isFinite(partyId) || partyId <= 0) errors.push('party_id is required');
+    if (!invoiceDate) errors.push('invoice_date is required');
+    if (!inputItems.length) errors.push('at least one item is required');
+    if (!['intra', 'inter'].includes(supplyType)) errors.push('supply_type must be intra or inter');
+
+    if (errors.length) return res.status(400).json({ error: errors.join(', ') });
+
+    const conn = await db.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [existingRows] = await conn.query(
+            "SELECT id, invoice_no, status FROM sales_invoices WHERE id = ? AND invoice_no LIKE 'CN-%' FOR UPDATE",
+            [creditNoteId]
+        );
+        if (!existingRows.length) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Credit note not found' });
+        }
+
+        if (String(existingRows[0].status) !== 'draft') {
+            await conn.rollback();
+            return res.status(400).json({ error: 'Only draft credit notes can be edited' });
+        }
+
+        const [partyRows] = await conn.query('SELECT id FROM parties WHERE id = ? LIMIT 1', [partyId]);
+        if (!partyRows.length) {
+            await conn.rollback();
+            return res.status(400).json({ error: 'party not found' });
+        }
+
+        const creditNoteNo = normalizeText(req.body.credit_note_no) || existingRows[0].invoice_no;
+        const { normalizedItems, errors: lineErrors } = await computeLines(conn, inputItems, supplyType);
+        if (lineErrors.length) {
+            await conn.rollback();
+            return res.status(400).json({ error: lineErrors.join(', ') });
+        }
+
+        const totals = summarizeTotals(normalizedItems, headerDiscountAmount, roundOff, 0);
+
+        await conn.query('UPDATE sales_invoices SET ? WHERE id = ?', [
+            {
+                invoice_no: creditNoteNo,
+                party_id: partyId,
+                invoice_date: invoiceDate,
+                due_date: dueDate,
+                place_of_supply: placeOfSupply,
+                subtotal: totals.subtotal,
+                discount_amount: round2(totals.lineDiscountTotal + headerDiscountAmount),
+                taxable_amount: totals.taxableAmount,
+                cgst_amount: totals.cgstAmount,
+                sgst_amount: totals.sgstAmount,
+                igst_amount: totals.igstAmount,
+                round_off: roundOff,
+                total_amount: totals.totalAmount,
+                paid_amount: 0,
+                balance_amount: totals.balanceAmount,
+                status,
+                notes,
+            },
+            creditNoteId,
+        ]);
+
+        await conn.query('DELETE FROM sales_invoice_items WHERE sales_invoice_id = ?', [creditNoteId]);
+        for (const line of normalizedItems) {
+            await conn.query('INSERT INTO sales_invoice_items SET ?', {
+                sales_invoice_id: creditNoteId,
+                ...line,
+            });
+        }
+
+        await conn.commit();
+        return res.json({ success: true, creditNoteId, creditNoteNo });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Credit note update error:', err);
+        if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Credit note number already exists' });
+        return res.status(500).json({ error: 'Failed to update credit note' });
+    } finally {
+        conn.release();
+    }
+});
+
+router.get('/:id/pdf', async (req, res) => {
+    try {
+        const [rows] = await db.query(
+            `
+            SELECT s.*, p.name AS party_name, p.phone AS party_phone, p.gstin AS party_gstin,
+                   p.billing_address AS party_billing_address, p.city AS party_city, p.state AS party_state
+            FROM sales_invoices s
+            JOIN parties p ON p.id = s.party_id
+            WHERE s.id = ? AND s.invoice_no LIKE 'CN-%'
+            LIMIT 1
+            `,
+            [req.params.id]
+        );
+
+        if (!rows.length) return res.status(404).json({ error: 'Credit note not found' });
+
+        const creditNote = rows[0];
+        const [itemRows] = await db.query(
+            `
+            SELECT item_name, hsn_code, quantity, unit, rate, taxable_value, gst_percent, line_total
+            FROM sales_invoice_items
+            WHERE sales_invoice_id = ?
+            ORDER BY id ASC
+            `,
+            [req.params.id]
+        );
+
+        const filename = `credit_note_${creditNote.invoice_no || creditNote.id}.pdf`;
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.type('application/pdf');
+
+        const doc = new PDFDocument({ margin: 40, size: 'A4' });
+        doc.pipe(res);
+
+        doc.fontSize(20).font('Helvetica-Bold').text('CREDIT NOTE', { align: 'right' });
+        doc.moveDown(0.3);
+        doc.fontSize(11).font('Helvetica').text(`Credit Note No: ${creditNote.invoice_no || '-'}`, { align: 'right' });
+        doc.text(`Date: ${String(creditNote.invoice_date || '').slice(0, 10)}`, { align: 'right' });
+
+        doc.moveDown(0.7);
+        doc.fontSize(12).font('Helvetica-Bold').text('Party');
+        doc.fontSize(11).font('Helvetica').text(creditNote.party_name || '-');
+        if (creditNote.party_phone) doc.text(`Phone: ${creditNote.party_phone}`);
+        if (creditNote.party_gstin) doc.text(`GSTIN: ${creditNote.party_gstin}`);
+
+        let y = doc.y + 14;
+        doc.font('Helvetica-Bold').fontSize(10).text('Item', 40, y);
+        doc.text('Qty', 280, y, { width: 60, align: 'right' });
+        doc.text('Rate', 350, y, { width: 70, align: 'right' });
+        doc.text('GST %', 430, y, { width: 60, align: 'right' });
+        doc.text('Line Total', 495, y, { width: 60, align: 'right' });
+        y += 18;
+
+        doc.font('Helvetica').fontSize(10);
+        itemRows.forEach((line) => {
+            doc.text(String(line.item_name || '-'), 40, y, { width: 220 });
+            doc.text(`${Number(line.quantity || 0).toFixed(0)} ${line.unit || ''}`, 280, y, { width: 60, align: 'right' });
+            doc.text(Number(line.rate || 0).toFixed(2), 350, y, { width: 70, align: 'right' });
+            doc.text(Number(line.gst_percent || 0).toFixed(2), 430, y, { width: 60, align: 'right' });
+            doc.text(Number(line.line_total || 0).toFixed(2), 495, y, { width: 60, align: 'right' });
+            y += 18;
+            if (y > 730) {
+                doc.addPage();
+                y = 60;
+            }
+        });
+
+        doc.moveTo(360, y + 6).lineTo(555, y + 6).stroke('#D1D5DB');
+        doc.font('Helvetica').fontSize(11);
+        doc.text(`Subtotal: ${Number(creditNote.subtotal || 0).toFixed(2)}`, 370, y + 14, { width: 185, align: 'right' });
+        doc.text(`Taxable: ${Number(creditNote.taxable_amount || 0).toFixed(2)}`, 370, y + 30, { width: 185, align: 'right' });
+        doc.text(`CGST: ${Number(creditNote.cgst_amount || 0).toFixed(2)}`, 370, y + 46, { width: 185, align: 'right' });
+        doc.text(`SGST: ${Number(creditNote.sgst_amount || 0).toFixed(2)}`, 370, y + 62, { width: 185, align: 'right' });
+        doc.text(`IGST: ${Number(creditNote.igst_amount || 0).toFixed(2)}`, 370, y + 78, { width: 185, align: 'right' });
+        doc.font('Helvetica-Bold').fontSize(12).text(`Credit Total: ${Number(creditNote.total_amount || 0).toFixed(2)}`, 350, y + 100, {
+            width: 205,
+            align: 'right',
+        });
+
+        doc.end();
+    } catch (err) {
+        console.error('Credit note pdf error:', err);
+        return res.status(500).json({ error: 'Failed to generate credit note PDF' });
+    }
+});
+
+export default router;
