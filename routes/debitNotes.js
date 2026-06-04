@@ -1,6 +1,7 @@
 import express from 'express';
 import db from '../db.js';
 import PDFDocument from 'pdfkit';
+import { buildCompanyContext, renderDocument } from '../utils/pdfRenderer.js';
 
 const router = express.Router();
 
@@ -430,55 +431,31 @@ router.get('/:id/pdf', async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
         res.type('application/pdf');
 
+        const company = await buildCompanyContext();
         const doc = new PDFDocument({ margin: 40, size: 'A4' });
         doc.pipe(res);
 
-        doc.fontSize(20).font('Helvetica-Bold').text('DEBIT NOTE', { align: 'right' });
-        doc.moveDown(0.3);
-        doc.fontSize(11).font('Helvetica').text(`Debit Note No: ${debitNote.bill_no || '-'}`, { align: 'right' });
-        doc.text(`Date: ${String(debitNote.bill_date || '').slice(0, 10)}`, { align: 'right' });
-
-        doc.moveDown(0.7);
-        doc.fontSize(12).font('Helvetica-Bold').text('Supplier');
-        doc.fontSize(11).font('Helvetica').text(debitNote.party_name || '-');
-        if (debitNote.party_phone) doc.text(`Phone: ${debitNote.party_phone}`);
-        if (debitNote.party_gstin) doc.text(`GSTIN: ${debitNote.party_gstin}`);
-
-        let y = doc.y + 14;
-        doc.font('Helvetica-Bold').fontSize(10).text('Item', 40, y);
-        doc.text('Qty', 280, y, { width: 60, align: 'right' });
-        doc.text('Rate', 350, y, { width: 70, align: 'right' });
-        doc.text('GST %', 430, y, { width: 60, align: 'right' });
-        doc.text('Line Total', 495, y, { width: 60, align: 'right' });
-        y += 18;
-
-        doc.font('Helvetica').fontSize(10);
-        itemRows.forEach((line) => {
-            doc.text(String(line.item_name || '-'), 40, y, { width: 220 });
-            doc.text(`${Number(line.quantity || 0).toFixed(0)} ${line.unit || ''}`, 280, y, { width: 60, align: 'right' });
-            doc.text(Number(line.rate || 0).toFixed(2), 350, y, { width: 70, align: 'right' });
-            doc.text(Number(line.gst_percent || 0).toFixed(2), 430, y, { width: 60, align: 'right' });
-            doc.text(Number(line.line_total || 0).toFixed(2), 495, y, { width: 60, align: 'right' });
-            y += 18;
-            if (y > 730) {
-                doc.addPage();
-                y = 60;
-            }
+        renderDocument({
+            doc,
+            company,
+            title: 'DEBIT NOTE',
+            meta: [
+                `Debit Note No: ${debitNote.bill_no || '-'}`,
+                `Date: ${String(debitNote.bill_date || '').slice(0, 10)}`,
+            ],
+            partyLabel: 'Supplier',
+            party: {
+                name: debitNote.party_name,
+                phone: debitNote.party_phone,
+                gstin: debitNote.party_gstin,
+                address: [debitNote.party_billing_address, debitNote.party_city, debitNote.party_state]
+                    .filter(Boolean)
+                    .join(', '),
+            },
+            items: itemRows,
+            totals: debitNote,
+            totalLabel: 'Debit Total',
         });
-
-        doc.moveTo(360, y + 6).lineTo(555, y + 6).stroke('#D1D5DB');
-        doc.font('Helvetica').fontSize(11);
-        doc.text(`Subtotal: ${Number(debitNote.subtotal || 0).toFixed(2)}`, 370, y + 14, { width: 185, align: 'right' });
-        doc.text(`Taxable: ${Number(debitNote.taxable_amount || 0).toFixed(2)}`, 370, y + 30, { width: 185, align: 'right' });
-        doc.text(`CGST: ${Number(debitNote.cgst_amount || 0).toFixed(2)}`, 370, y + 46, { width: 185, align: 'right' });
-        doc.text(`SGST: ${Number(debitNote.sgst_amount || 0).toFixed(2)}`, 370, y + 62, { width: 185, align: 'right' });
-        doc.text(`IGST: ${Number(debitNote.igst_amount || 0).toFixed(2)}`, 370, y + 78, { width: 185, align: 'right' });
-        doc.font('Helvetica-Bold').fontSize(12).text(`Debit Total: ${Number(debitNote.total_amount || 0).toFixed(2)}`, 350, y + 100, {
-            width: 205,
-            align: 'right',
-        });
-
-        doc.end();
     } catch (err) {
         console.error('Debit note pdf error:', err);
         return res.status(500).json({ error: 'Failed to generate debit note PDF' });

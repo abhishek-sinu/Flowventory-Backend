@@ -1,6 +1,7 @@
 import express from 'express';
 import db from '../db.js';
 import PDFDocument from 'pdfkit';
+import { buildCompanyContext, renderDocument } from '../utils/pdfRenderer.js';
 
 const router = express.Router();
 
@@ -194,89 +195,34 @@ router.get('/:id/pdf', async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
         res.type('application/pdf');
 
+        const company = await buildCompanyContext();
         const doc = new PDFDocument({ margin: 40, size: 'A4' });
         doc.pipe(res);
 
-        doc.fontSize(20).font('Helvetica-Bold').text('TAX INVOICE', { align: 'right' });
-        doc.moveDown(0.3);
-        doc.fontSize(11).font('Helvetica').text(`Invoice No: ${invoice.invoice_no || '-'}`, { align: 'right' });
-        doc.text(`Invoice Date: ${String(invoice.invoice_date || '').slice(0, 10)}`, { align: 'right' });
-        if (invoice.due_date) {
-            doc.text(`Due Date: ${String(invoice.due_date || '').slice(0, 10)}`, { align: 'right' });
-        }
-
-        doc.moveDown(0.7);
-        doc.fontSize(12).font('Helvetica-Bold').text('Bill To');
-        doc.fontSize(11).font('Helvetica').text(invoice.party_name || '-');
-        if (invoice.party_phone) doc.text(`Phone: ${invoice.party_phone}`);
-        if (invoice.party_gstin) doc.text(`GSTIN: ${invoice.party_gstin}`);
-        const address = [invoice.party_billing_address, invoice.party_city, invoice.party_state]
-            .filter(Boolean)
-            .join(', ');
-        if (address) doc.text(address);
-
-        doc.moveDown(0.8);
-        const tableTop = doc.y;
-        const x = 40;
-        const w = [24, 180, 56, 50, 70, 70, 70];
-        const headers = ['#', 'Item', 'Qty', 'Rate', 'Taxable', 'GST', 'Line Total'];
-        let cursorX = x;
-
-        doc.font('Helvetica-Bold').fontSize(10);
-        headers.forEach((header, i) => {
-            doc.rect(cursorX, tableTop, w[i], 22).fillAndStroke('#E5E7EB', '#D1D5DB');
-            doc.fillColor('#111827').text(header, cursorX + 4, tableTop + 7, {
-                width: w[i] - 8,
-                align: i >= 2 ? 'right' : 'left',
-            });
-            cursorX += w[i];
+        renderDocument({
+            doc,
+            company,
+            title: 'TAX INVOICE',
+            meta: [
+                `Invoice No: ${invoice.invoice_no || '-'}`,
+                `Invoice Date: ${String(invoice.invoice_date || '').slice(0, 10)}`,
+                invoice.due_date ? `Due Date: ${String(invoice.due_date || '').slice(0, 10)}` : '',
+            ],
+            partyLabel: 'Bill To',
+            party: {
+                name: invoice.party_name,
+                phone: invoice.party_phone,
+                gstin: invoice.party_gstin,
+                address: [invoice.party_billing_address, invoice.party_city, invoice.party_state]
+                    .filter(Boolean)
+                    .join(', '),
+            },
+            items: itemRows,
+            totals: invoice,
+            totalLabel: 'Grand Total',
+            payment: { paid: invoice.paid_amount, balance: invoice.balance_amount },
         });
 
-        let y = tableTop + 22;
-        doc.font('Helvetica').fontSize(9);
-        itemRows.forEach((line, idx) => {
-            cursorX = x;
-            const row = [
-                String(idx + 1),
-                `${line.item_name || '-'}${line.hsn_code ? `\nHSN: ${line.hsn_code}` : ''}`,
-                `${Number(line.quantity || 0).toFixed(3)} ${line.unit || ''}`,
-                Number(line.rate || 0).toFixed(2),
-                Number(line.taxable_value || 0).toFixed(2),
-                Number(line.gst_percent || 0).toFixed(2),
-                Number(line.line_total || 0).toFixed(2),
-            ];
-
-            const rowHeight = 28;
-            row.forEach((cell, i) => {
-                doc.rect(cursorX, y, w[i], rowHeight).stroke('#E5E7EB');
-                doc.fillColor('#111827').text(cell, cursorX + 4, y + 7, {
-                    width: w[i] - 8,
-                    align: i >= 2 ? 'right' : 'left',
-                    ellipsis: true,
-                });
-                cursorX += w[i];
-            });
-
-            y += rowHeight;
-            if (y > 700) {
-                doc.addPage();
-                y = 60;
-            }
-        });
-
-        doc.moveTo(350, y + 10).lineTo(555, y + 10).stroke('#D1D5DB');
-        doc.font('Helvetica').fontSize(10);
-        doc.text(`Subtotal: ${Number(invoice.subtotal || 0).toFixed(2)}`, 370, y + 18, { width: 185, align: 'right' });
-        doc.text(`Taxable: ${Number(invoice.taxable_amount || 0).toFixed(2)}`, 370, y + 34, { width: 185, align: 'right' });
-        doc.text(`CGST: ${Number(invoice.cgst_amount || 0).toFixed(2)}`, 370, y + 50, { width: 185, align: 'right' });
-        doc.text(`SGST: ${Number(invoice.sgst_amount || 0).toFixed(2)}`, 370, y + 66, { width: 185, align: 'right' });
-        doc.text(`IGST: ${Number(invoice.igst_amount || 0).toFixed(2)}`, 370, y + 82, { width: 185, align: 'right' });
-        doc.font('Helvetica-Bold').fontSize(12).text(`Grand Total: ${Number(invoice.total_amount || 0).toFixed(2)}`, 350, y + 102, {
-            width: 205,
-            align: 'right',
-        });
-
-        doc.end();
         return;
     } catch (err) {
         console.error('Sales invoice pdf error:', err);

@@ -1,6 +1,7 @@
 import express from 'express';
 import db from '../db.js';
 import PDFDocument from 'pdfkit';
+import { buildCompanyContext, renderDocument } from '../utils/pdfRenderer.js';
 
 const router = express.Router();
 
@@ -430,55 +431,31 @@ router.get('/:id/pdf', async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
         res.type('application/pdf');
 
+        const company = await buildCompanyContext();
         const doc = new PDFDocument({ margin: 40, size: 'A4' });
         doc.pipe(res);
 
-        doc.fontSize(20).font('Helvetica-Bold').text('CREDIT NOTE', { align: 'right' });
-        doc.moveDown(0.3);
-        doc.fontSize(11).font('Helvetica').text(`Credit Note No: ${creditNote.invoice_no || '-'}`, { align: 'right' });
-        doc.text(`Date: ${String(creditNote.invoice_date || '').slice(0, 10)}`, { align: 'right' });
-
-        doc.moveDown(0.7);
-        doc.fontSize(12).font('Helvetica-Bold').text('Party');
-        doc.fontSize(11).font('Helvetica').text(creditNote.party_name || '-');
-        if (creditNote.party_phone) doc.text(`Phone: ${creditNote.party_phone}`);
-        if (creditNote.party_gstin) doc.text(`GSTIN: ${creditNote.party_gstin}`);
-
-        let y = doc.y + 14;
-        doc.font('Helvetica-Bold').fontSize(10).text('Item', 40, y);
-        doc.text('Qty', 280, y, { width: 60, align: 'right' });
-        doc.text('Rate', 350, y, { width: 70, align: 'right' });
-        doc.text('GST %', 430, y, { width: 60, align: 'right' });
-        doc.text('Line Total', 495, y, { width: 60, align: 'right' });
-        y += 18;
-
-        doc.font('Helvetica').fontSize(10);
-        itemRows.forEach((line) => {
-            doc.text(String(line.item_name || '-'), 40, y, { width: 220 });
-            doc.text(`${Number(line.quantity || 0).toFixed(0)} ${line.unit || ''}`, 280, y, { width: 60, align: 'right' });
-            doc.text(Number(line.rate || 0).toFixed(2), 350, y, { width: 70, align: 'right' });
-            doc.text(Number(line.gst_percent || 0).toFixed(2), 430, y, { width: 60, align: 'right' });
-            doc.text(Number(line.line_total || 0).toFixed(2), 495, y, { width: 60, align: 'right' });
-            y += 18;
-            if (y > 730) {
-                doc.addPage();
-                y = 60;
-            }
+        renderDocument({
+            doc,
+            company,
+            title: 'CREDIT NOTE',
+            meta: [
+                `Credit Note No: ${creditNote.invoice_no || '-'}`,
+                `Date: ${String(creditNote.invoice_date || '').slice(0, 10)}`,
+            ],
+            partyLabel: 'Party',
+            party: {
+                name: creditNote.party_name,
+                phone: creditNote.party_phone,
+                gstin: creditNote.party_gstin,
+                address: [creditNote.party_billing_address, creditNote.party_city, creditNote.party_state]
+                    .filter(Boolean)
+                    .join(', '),
+            },
+            items: itemRows,
+            totals: creditNote,
+            totalLabel: 'Credit Total',
         });
-
-        doc.moveTo(360, y + 6).lineTo(555, y + 6).stroke('#D1D5DB');
-        doc.font('Helvetica').fontSize(11);
-        doc.text(`Subtotal: ${Number(creditNote.subtotal || 0).toFixed(2)}`, 370, y + 14, { width: 185, align: 'right' });
-        doc.text(`Taxable: ${Number(creditNote.taxable_amount || 0).toFixed(2)}`, 370, y + 30, { width: 185, align: 'right' });
-        doc.text(`CGST: ${Number(creditNote.cgst_amount || 0).toFixed(2)}`, 370, y + 46, { width: 185, align: 'right' });
-        doc.text(`SGST: ${Number(creditNote.sgst_amount || 0).toFixed(2)}`, 370, y + 62, { width: 185, align: 'right' });
-        doc.text(`IGST: ${Number(creditNote.igst_amount || 0).toFixed(2)}`, 370, y + 78, { width: 185, align: 'right' });
-        doc.font('Helvetica-Bold').fontSize(12).text(`Credit Total: ${Number(creditNote.total_amount || 0).toFixed(2)}`, 350, y + 100, {
-            width: 205,
-            align: 'right',
-        });
-
-        doc.end();
     } catch (err) {
         console.error('Credit note pdf error:', err);
         return res.status(500).json({ error: 'Failed to generate credit note PDF' });

@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { authenticateToken, authorizeRoles } from './middleware/security.js';
 import usersRouter from './routes/users.js';
 import authRouter from './routes/auth.js';
@@ -35,6 +37,10 @@ app.use(cors({
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok' });
 });
+
+// Serve uploaded files (e.g. company logos) statically.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Public routes
 app.use('/api/auth', authRouter);

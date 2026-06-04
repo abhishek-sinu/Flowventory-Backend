@@ -1,6 +1,7 @@
 import express from 'express';
 import db from '../db.js';
 import PDFDocument from 'pdfkit';
+import { buildCompanyContext, renderDocument } from '../utils/pdfRenderer.js';
 
 const router = express.Router();
 
@@ -430,56 +431,32 @@ router.get('/:id/pdf', async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
         res.type('application/pdf');
 
+        const company = await buildCompanyContext();
         const doc = new PDFDocument({ margin: 40, size: 'A4' });
         doc.pipe(res);
 
-        doc.fontSize(20).font('Helvetica-Bold').text('ESTIMATE', { align: 'right' });
-        doc.moveDown(0.3);
-        doc.fontSize(11).font('Helvetica').text(`Estimate No: ${estimate.invoice_no || '-'}`, { align: 'right' });
-        doc.text(`Estimate Date: ${String(estimate.invoice_date || '').slice(0, 10)}`, { align: 'right' });
-        if (estimate.due_date) doc.text(`Valid Until: ${String(estimate.due_date || '').slice(0, 10)}`, { align: 'right' });
-
-        doc.moveDown(0.7);
-        doc.fontSize(12).font('Helvetica-Bold').text('Prepared For');
-        doc.fontSize(11).font('Helvetica').text(estimate.party_name || '-');
-        if (estimate.party_phone) doc.text(`Phone: ${estimate.party_phone}`);
-        if (estimate.party_gstin) doc.text(`GSTIN: ${estimate.party_gstin}`);
-
-        let y = doc.y + 14;
-        doc.font('Helvetica-Bold').fontSize(10).text('Item', 40, y);
-        doc.text('Qty', 280, y, { width: 60, align: 'right' });
-        doc.text('Rate', 350, y, { width: 70, align: 'right' });
-        doc.text('GST %', 430, y, { width: 60, align: 'right' });
-        doc.text('Line Total', 495, y, { width: 60, align: 'right' });
-        y += 18;
-
-        doc.font('Helvetica').fontSize(10);
-        itemRows.forEach((line) => {
-            doc.text(String(line.item_name || '-'), 40, y, { width: 220 });
-            doc.text(`${Number(line.quantity || 0).toFixed(0)} ${line.unit || ''}`, 280, y, { width: 60, align: 'right' });
-            doc.text(Number(line.rate || 0).toFixed(2), 350, y, { width: 70, align: 'right' });
-            doc.text(Number(line.gst_percent || 0).toFixed(2), 430, y, { width: 60, align: 'right' });
-            doc.text(Number(line.line_total || 0).toFixed(2), 495, y, { width: 60, align: 'right' });
-            y += 18;
-            if (y > 730) {
-                doc.addPage();
-                y = 60;
-            }
+        renderDocument({
+            doc,
+            company,
+            title: 'ESTIMATE',
+            meta: [
+                `Estimate No: ${estimate.invoice_no || '-'}`,
+                `Estimate Date: ${String(estimate.invoice_date || '').slice(0, 10)}`,
+                estimate.due_date ? `Valid Until: ${String(estimate.due_date || '').slice(0, 10)}` : '',
+            ],
+            partyLabel: 'Prepared For',
+            party: {
+                name: estimate.party_name,
+                phone: estimate.party_phone,
+                gstin: estimate.party_gstin,
+                address: [estimate.party_billing_address, estimate.party_city, estimate.party_state]
+                    .filter(Boolean)
+                    .join(', '),
+            },
+            items: itemRows,
+            totals: estimate,
+            totalLabel: 'Estimate Total',
         });
-
-        doc.moveTo(360, y + 6).lineTo(555, y + 6).stroke('#D1D5DB');
-        doc.font('Helvetica').fontSize(11);
-        doc.text(`Subtotal: ${Number(estimate.subtotal || 0).toFixed(2)}`, 370, y + 14, { width: 185, align: 'right' });
-        doc.text(`Taxable: ${Number(estimate.taxable_amount || 0).toFixed(2)}`, 370, y + 30, { width: 185, align: 'right' });
-        doc.text(`CGST: ${Number(estimate.cgst_amount || 0).toFixed(2)}`, 370, y + 46, { width: 185, align: 'right' });
-        doc.text(`SGST: ${Number(estimate.sgst_amount || 0).toFixed(2)}`, 370, y + 62, { width: 185, align: 'right' });
-        doc.text(`IGST: ${Number(estimate.igst_amount || 0).toFixed(2)}`, 370, y + 78, { width: 185, align: 'right' });
-        doc.font('Helvetica-Bold').fontSize(12).text(`Estimate Total: ${Number(estimate.total_amount || 0).toFixed(2)}`, 350, y + 100, {
-            width: 205,
-            align: 'right',
-        });
-
-        doc.end();
     } catch (err) {
         console.error('Estimate pdf error:', err);
         return res.status(500).json({ error: 'Failed to generate estimate PDF' });

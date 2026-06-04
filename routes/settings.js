@@ -1,7 +1,36 @@
 import express from 'express';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 import db from '../db.js';
 
 const router = express.Router();
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const uploadsDir = path.join(__dirname, '..', 'uploads');
+
+// Ensure uploads directory exists.
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+const ALLOWED_LOGO_TYPES = ['image/png', 'image/jpeg', 'image/jpg'];
+
+const logoUpload = multer({
+    storage: multer.diskStorage({
+        destination: (_req, _file, cb) => cb(null, uploadsDir),
+        filename: (_req, file, cb) => {
+            const ext = path.extname(file.originalname).toLowerCase() || '.png';
+            cb(null, `logo_${Date.now()}${ext}`);
+        },
+    }),
+    limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB
+    fileFilter: (_req, file, cb) => {
+        if (ALLOWED_LOGO_TYPES.includes(file.mimetype)) return cb(null, true);
+        return cb(new Error('Only PNG or JPEG images are allowed'));
+    },
+});
 
 function normalizeText(value) {
     if (value === undefined || value === null) return null;
@@ -20,6 +49,21 @@ function toBoolInt(value, fallback = 1) {
     if (value === false || value === 0 || value === '0' || value === 'false') return 0;
     return fallback;
 }
+
+// Upload a company logo image and return its stored URL path.
+router.post('/company-logo', (req, res) => {
+    logoUpload.single('logo')(req, res, (err) => {
+        if (err) {
+            return res.status(400).json({ error: err.message || 'Logo upload failed' });
+        }
+        if (!req.file) {
+            return res.status(400).json({ error: 'No image file provided' });
+        }
+        // Path served statically by the backend (see server.js).
+        const logoUrl = `/uploads/${req.file.filename}`;
+        return res.json({ logo_url: logoUrl });
+    });
+});
 
 router.get('/company-profile', async (_req, res) => {
     try {
