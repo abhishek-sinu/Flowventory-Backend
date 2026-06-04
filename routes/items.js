@@ -59,6 +59,7 @@ function buildItemPayload(body, { isUpdate = false } = {}) {
     const payload = {
         name: normalizeText(body.name),
         sku: normalizeText(body.sku),
+        barcode: normalizeText(body.barcode),
         category: normalizeText(body.category),
         unit: normalizeText(body.unit) || 'pcs',
         hsn_code: normalizeText(body.hsn_code),
@@ -92,6 +93,7 @@ router.get('/template', async (_req, res) => {
             {
                 name: 'Parle-G 100g',
                 sku: 'FMCG-PARLE-100G',
+                barcode: '8901234567890',
                 category: 'Biscuits',
                 unit: 'pcs',
                 hsn_code: '1905',
@@ -159,6 +161,7 @@ router.post('/import', upload.single('file'), async (req, res) => {
         const normalizedRow = {
             name: pickValue(row, ['name', 'item_name', 'item name', 'Item Name']),
             sku: pickValue(row, ['sku', 'SKU']),
+            barcode: pickValue(row, ['barcode', 'Barcode', 'bar_code']),
             category: pickValue(row, ['category', 'Category']),
             unit: pickValue(row, ['unit', 'Unit']),
             hsn_code: pickValue(row, ['hsn_code', 'hsn', 'HSN', 'HSN Code', 'hsn code']),
@@ -236,9 +239,9 @@ router.get('/', async (req, res) => {
     const params = [];
 
     if (q) {
-        conditions.push('(name LIKE ? OR sku LIKE ?)');
+        conditions.push('(name LIKE ? OR sku LIKE ? OR barcode LIKE ?)');
         const pattern = `%${q}%`;
-        params.push(pattern, pattern);
+        params.push(pattern, pattern, pattern);
     }
 
     if (category) {
@@ -271,6 +274,7 @@ router.get('/', async (req, res) => {
                 id,
                 name,
                 sku,
+                barcode,
                 category,
                 unit,
                 hsn_code,
@@ -307,6 +311,27 @@ router.get('/', async (req, res) => {
     }
 });
 
+router.get('/by-barcode/:code', async (req, res) => {
+    const code = String(req.params.code || '').trim();
+    if (!code) {
+        return res.status(400).json({ error: 'Barcode is required' });
+    }
+
+    try {
+        const [rows] = await db.query(
+            'SELECT * FROM items WHERE barcode = ? AND is_active = 1 LIMIT 1',
+            [code]
+        );
+        if (!rows.length) {
+            return res.status(404).json({ error: 'No item found for this barcode' });
+        }
+        res.json(rows[0]);
+    } catch (err) {
+        console.error('Items by-barcode error:', err);
+        res.status(500).json({ error: 'Failed to lookup barcode' });
+    }
+});
+
 router.get('/:id', async (req, res) => {
     try {
         const [rows] = await db.query('SELECT * FROM items WHERE id = ?', [req.params.id]);
@@ -328,6 +353,15 @@ router.post('/', async (req, res) => {
 
     try {
         const [result] = await db.query('INSERT INTO items SET ?', payload);
+
+        // Auto-generate a Code128-friendly barcode when none was provided.
+        if (!payload.barcode) {
+            const generated = `FLV${String(result.insertId).padStart(9, '0')}`;
+            try {
+                await db.query('UPDATE items SET barcode = ? WHERE id = ?', [generated, result.insertId]);
+            } catch (_) {}
+        }
+
         if (req.user?.id) {
             try {
                 await db.query('INSERT INTO audit_logs SET ?', {
@@ -342,7 +376,10 @@ router.post('/', async (req, res) => {
     } catch (err) {
         console.error('Items create error:', err);
         if (err.code === 'ER_DUP_ENTRY') {
-            return res.status(409).json({ error: 'SKU already exists' });
+            const msg = String(err.sqlMessage || '').includes('uq_items_barcode')
+                ? 'Barcode already exists'
+                : 'SKU already exists';
+            return res.status(409).json({ error: msg });
         }
         res.status(500).json({ error: 'Failed to create item' });
     }
@@ -375,7 +412,10 @@ router.put('/:id', async (req, res) => {
     } catch (err) {
         console.error('Items update error:', err);
         if (err.code === 'ER_DUP_ENTRY') {
-            return res.status(409).json({ error: 'SKU already exists' });
+            const msg = String(err.sqlMessage || '').includes('uq_items_barcode')
+                ? 'Barcode already exists'
+                : 'SKU already exists';
+            return res.status(409).json({ error: msg });
         }
         res.status(500).json({ error: 'Failed to update item' });
     }
