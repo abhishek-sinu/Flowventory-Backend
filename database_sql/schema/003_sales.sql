@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS sales_invoices (
     place_of_supply VARCHAR(80) NULL,
     subtotal DECIMAL(14,2) NOT NULL DEFAULT 0.00,
     discount_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+    header_discount_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00,
     taxable_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00,
     cgst_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00,
     sgst_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00,

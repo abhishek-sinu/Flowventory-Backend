@@ -113,7 +113,7 @@ async function computeLines(conn, inputItems, supplyType) {
 }
 
 function summarizeTotals(lines, headerDiscountAmount, roundOff, paidAmount) {
-    const subtotal = round2(lines.reduce((sum, line) => sum + line.quantity * line.rate, 0));
+    const subtotal = round2(lines.reduce((sum, line) => sum + round2(line.quantity * line.rate), 0));
     const lineDiscountTotal = round2(lines.reduce((sum, line) => sum + line.discount_amount, 0));
     const taxableAmountBeforeHeader = round2(lines.reduce((sum, line) => sum + line.taxable_value, 0));
     const taxableAmount = round2(Math.max(0, taxableAmountBeforeHeader - headerDiscountAmount));
@@ -271,6 +271,7 @@ router.post('/', async (req, res) => {
             place_of_supply: placeOfSupply,
             subtotal: totals.subtotal,
             discount_amount: round2(totals.lineDiscountTotal + headerDiscountAmount),
+            header_discount_amount: round2(headerDiscountAmount),
             taxable_amount: totals.taxableAmount,
             cgst_amount: totals.cgstAmount,
             sgst_amount: totals.sgstAmount,
@@ -366,6 +367,7 @@ router.put('/:id', async (req, res) => {
                 place_of_supply: placeOfSupply,
                 subtotal: totals.subtotal,
                 discount_amount: round2(totals.lineDiscountTotal + headerDiscountAmount),
+                header_discount_amount: round2(headerDiscountAmount),
                 taxable_amount: totals.taxableAmount,
                 cgst_amount: totals.cgstAmount,
                 sgst_amount: totals.sgstAmount,

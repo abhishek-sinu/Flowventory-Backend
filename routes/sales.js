@@ -2,6 +2,7 @@ import express from 'express';
 import db from '../db.js';
 import PDFDocument from 'pdfkit';
 import { buildCompanyContext, renderDocument } from '../utils/pdfRenderer.js';
+import { getNextReceiptNo } from './paymentIn.js';
 
 const router = express.Router();
 
@@ -18,6 +19,12 @@ function normalizeText(value) {
 
 function round2(value) {
     return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
+// Stock is deducted only for invoices that actually leave inventory.
+// Drafts and cancelled invoices do not affect stock.
+function reducesStock(status) {
+    return status !== 'draft' && status !== 'cancelled';
 }
 
 async function getNextInvoiceNo(conn) {
@@ -338,7 +345,7 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: errors.join(', ') });
         }
 
-        const subtotal = round2(normalizedItems.reduce((sum, line) => sum + line.quantity * line.rate, 0));
+        const subtotal = round2(normalizedItems.reduce((sum, line) => sum + round2(line.quantity * line.rate), 0));
         const lineDiscountTotal = round2(normalizedItems.reduce((sum, line) => sum + line.discount_amount, 0));
         const taxableAmountBeforeHeader = round2(normalizedItems.reduce((sum, line) => sum + line.taxable_value, 0));
 
@@ -360,6 +367,7 @@ router.post('/', async (req, res) => {
             place_of_supply: placeOfSupply,
             subtotal,
             discount_amount: round2(lineDiscountTotal + headerDiscountAmount),
+            header_discount_amount: round2(headerDiscountAmount),
             taxable_amount: taxableAmount,
             cgst_amount: cgstAmount,
             sgst_amount: sgstAmount,
@@ -376,6 +384,32 @@ router.post('/', async (req, res) => {
             await conn.query('INSERT INTO sales_invoice_items SET ?', {
                 sales_invoice_id: invoiceResult.insertId,
                 ...line,
+            });
+        }
+
+        if (reducesStock(status)) {
+            for (const line of normalizedItems) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock - ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
+        }
+
+        // If the invoice is created with an upfront paid amount, record a matching
+        // Payment In receipt so the party ledger and receivables stay consistent.
+        // Only for booked sales invoices (SINV-, not draft/cancelled/estimate/DC).
+        if (paidAmount > 0 && reducesStock(status) && String(invoiceNo).startsWith('SINV-')) {
+            const receiptNo = await getNextReceiptNo(conn);
+            await conn.query('INSERT INTO payment_in SET ?', {
+                receipt_no: receiptNo,
+                party_id: partyId,
+                sales_invoice_id: invoiceResult.insertId,
+                payment_date: invoiceDate,
+                amount: round2(paidAmount),
+                payment_mode: 'cash',
+                reference_no: null,
+                notes: `Auto-recorded with invoice ${invoiceNo}`,
             });
         }
 
@@ -547,7 +581,7 @@ router.put('/:id', async (req, res) => {
             return res.status(400).json({ error: errors.join(', ') });
         }
 
-        const subtotal = round2(normalizedItems.reduce((sum, line) => sum + line.quantity * line.rate, 0));
+        const subtotal = round2(normalizedItems.reduce((sum, line) => sum + round2(line.quantity * line.rate), 0));
         const lineDiscountTotal = round2(normalizedItems.reduce((sum, line) => sum + line.discount_amount, 0));
         const taxableAmountBeforeHeader = round2(normalizedItems.reduce((sum, line) => sum + line.taxable_value, 0));
 
@@ -570,6 +604,7 @@ router.put('/:id', async (req, res) => {
                 place_of_supply: placeOfSupply,
                 subtotal,
                 discount_amount: round2(lineDiscountTotal + headerDiscountAmount),
+                header_discount_amount: round2(headerDiscountAmount),
                 taxable_amount: taxableAmount,
                 cgst_amount: cgstAmount,
                 sgst_amount: sgstAmount,
@@ -590,6 +625,17 @@ router.put('/:id', async (req, res) => {
                 sales_invoice_id: invoiceId,
                 ...line,
             });
+        }
+
+        // Existing invoice was a draft (enforced above), so no stock was deducted yet.
+        // Deduct now if it is being confirmed.
+        if (reducesStock(status)) {
+            for (const line of normalizedItems) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock - ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
         }
 
         if (req.user?.id) {
@@ -630,6 +676,92 @@ router.put('/:id', async (req, res) => {
             return res.status(409).json({ error: 'Invoice number already exists' });
         }
         return res.status(500).json({ error: 'Failed to update sales invoice' });
+    } finally {
+        conn.release();
+    }
+});
+
+// Cancel a sales invoice and reverse its stock impact.
+// A confirmed sale removed stock, so cancelling it adds that stock back.
+router.post('/:id/cancel', async (req, res) => {
+    const invoiceId = Number(req.params.id);
+    if (!Number.isFinite(invoiceId) || invoiceId <= 0) {
+        return res.status(400).json({ error: 'valid invoice id is required' });
+    }
+
+    const conn = await db.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [rows] = await conn.query(
+            'SELECT id, invoice_no, status, paid_amount, balance_amount FROM sales_invoices WHERE id = ? FOR UPDATE',
+            [invoiceId]
+        );
+        if (!rows.length) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Invoice not found' });
+        }
+
+        const current = rows[0];
+        if (String(current.status) === 'cancelled') {
+            await conn.rollback();
+            return res.status(400).json({ error: 'Invoice is already cancelled' });
+        }
+
+        // Block cancellation if payments have been recorded against this invoice.
+        // The user must delete those payments first so the ledger stays consistent.
+        const [paymentRows] = await conn.query(
+            'SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total FROM payment_in WHERE sales_invoice_id = ?',
+            [invoiceId]
+        );
+        if (Number(paymentRows[0]?.cnt || 0) > 0) {
+            await conn.rollback();
+            return res.status(409).json({
+                error: `Cannot cancel: ${paymentRows[0].cnt} payment(s) totalling ${Number(paymentRows[0].total).toFixed(2)} are linked to this invoice. Delete the payment(s) first.`,
+            });
+        }
+
+        // Only restore stock if the invoice had actually deducted it.
+        if (reducesStock(current.status)) {
+            const [lines] = await conn.query(
+                'SELECT item_id, quantity FROM sales_invoice_items WHERE sales_invoice_id = ?',
+                [invoiceId]
+            );
+            for (const line of lines) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock + ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
+        }
+
+        // Zero out the financials: a cancelled invoice owes nothing and is paid nothing.
+        await conn.query(
+            'UPDATE sales_invoices SET status = ?, paid_amount = 0, balance_amount = 0 WHERE id = ?',
+            ['cancelled', invoiceId]
+        );
+
+        if (req.user?.id) {
+            try {
+                await conn.query('INSERT INTO audit_logs SET ?', {
+                    user_id: req.user.id,
+                    action: 'cancel_sales_invoice',
+                    details: JSON.stringify({
+                        sales_invoice_id: invoiceId,
+                        invoice_no: current.invoice_no,
+                        previous_status: current.status,
+                        stock_restored: reducesStock(current.status),
+                    }),
+                });
+            } catch (_) {}
+        }
+
+        await conn.commit();
+        return res.json({ success: true, id: invoiceId, status: 'cancelled' });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Sales cancel error:', err);
+        return res.status(500).json({ error: 'Failed to cancel sales invoice' });
     } finally {
         conn.release();
     }

@@ -20,6 +20,12 @@ function round2(value) {
     return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
+// A credit note is a sales return: confirming it brings goods back into stock.
+// Drafts and cancelled notes do not affect stock.
+function affectsStock(status) {
+    return status !== 'draft' && status !== 'cancelled';
+}
+
 async function getNextCreditNoteNo(conn) {
     const [rows] = await conn.query(
         "SELECT invoice_no FROM sales_invoices WHERE invoice_no LIKE 'CN-%' ORDER BY id DESC LIMIT 1"
@@ -113,7 +119,7 @@ async function computeLines(conn, inputItems, supplyType) {
 }
 
 function summarizeTotals(lines, headerDiscountAmount, roundOff, paidAmount) {
-    const subtotal = round2(lines.reduce((sum, line) => sum + line.quantity * line.rate, 0));
+    const subtotal = round2(lines.reduce((sum, line) => sum + round2(line.quantity * line.rate), 0));
     const lineDiscountTotal = round2(lines.reduce((sum, line) => sum + line.discount_amount, 0));
     const taxableAmountBeforeHeader = round2(lines.reduce((sum, line) => sum + line.taxable_value, 0));
     const taxableAmount = round2(Math.max(0, taxableAmountBeforeHeader - headerDiscountAmount));
@@ -271,6 +277,7 @@ router.post('/', async (req, res) => {
             place_of_supply: placeOfSupply,
             subtotal: totals.subtotal,
             discount_amount: round2(totals.lineDiscountTotal + headerDiscountAmount),
+            header_discount_amount: round2(headerDiscountAmount),
             taxable_amount: totals.taxableAmount,
             cgst_amount: totals.cgstAmount,
             sgst_amount: totals.sgstAmount,
@@ -288,6 +295,15 @@ router.post('/', async (req, res) => {
                 sales_invoice_id: result.insertId,
                 ...line,
             });
+        }
+
+        if (affectsStock(status)) {
+            for (const line of normalizedItems) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock + ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
         }
 
         await conn.commit();
@@ -366,6 +382,7 @@ router.put('/:id', async (req, res) => {
                 place_of_supply: placeOfSupply,
                 subtotal: totals.subtotal,
                 discount_amount: round2(totals.lineDiscountTotal + headerDiscountAmount),
+                header_discount_amount: round2(headerDiscountAmount),
                 taxable_amount: totals.taxableAmount,
                 cgst_amount: totals.cgstAmount,
                 sgst_amount: totals.sgstAmount,
@@ -388,6 +405,17 @@ router.put('/:id', async (req, res) => {
             });
         }
 
+        // Existing note was a draft (enforced above), so no stock was added yet.
+        // Add now if it is being confirmed.
+        if (affectsStock(status)) {
+            for (const line of normalizedItems) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock + ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
+        }
+
         await conn.commit();
         return res.json({ success: true, creditNoteId, creditNoteNo });
     } catch (err) {
@@ -395,6 +423,75 @@ router.put('/:id', async (req, res) => {
         console.error('Credit note update error:', err);
         if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Credit note number already exists' });
         return res.status(500).json({ error: 'Failed to update credit note' });
+    } finally {
+        conn.release();
+    }
+});
+
+// Cancel a credit note and reverse its stock impact.
+// A confirmed credit note added stock back, so cancelling removes it again.
+router.post('/:id/cancel', async (req, res) => {
+    const creditNoteId = Number(req.params.id);
+    if (!Number.isFinite(creditNoteId) || creditNoteId <= 0) {
+        return res.status(400).json({ error: 'valid credit note id is required' });
+    }
+
+    const conn = await db.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [rows] = await conn.query(
+            "SELECT id, invoice_no, status FROM sales_invoices WHERE id = ? AND invoice_no LIKE 'CN-%' FOR UPDATE",
+            [creditNoteId]
+        );
+        if (!rows.length) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Credit note not found' });
+        }
+
+        const current = rows[0];
+        if (String(current.status) === 'cancelled') {
+            await conn.rollback();
+            return res.status(400).json({ error: 'Credit note is already cancelled' });
+        }
+
+        if (affectsStock(current.status)) {
+            const [lines] = await conn.query(
+                'SELECT item_id, item_name, quantity FROM sales_invoice_items WHERE sales_invoice_id = ?',
+                [creditNoteId]
+            );
+
+            // Block if reversing the returned stock would make any item go negative.
+            for (const line of lines) {
+                const [itemRows] = await conn.query(
+                    'SELECT current_stock FROM items WHERE id = ? FOR UPDATE',
+                    [line.item_id]
+                );
+                const stock = itemRows.length ? Number(itemRows[0].current_stock || 0) : 0;
+                if (stock - Number(line.quantity) < 0) {
+                    await conn.rollback();
+                    return res.status(400).json({
+                        error: `Cannot cancel: not enough stock to reverse for "${line.item_name}".`,
+                    });
+                }
+            }
+
+            for (const line of lines) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock - ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
+        }
+
+        await conn.query('UPDATE sales_invoices SET status = ? WHERE id = ?', ['cancelled', creditNoteId]);
+
+        await conn.commit();
+        return res.json({ success: true, id: creditNoteId, status: 'cancelled' });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Credit note cancel error:', err);
+        return res.status(500).json({ error: 'Failed to cancel credit note' });
     } finally {
         conn.release();
     }

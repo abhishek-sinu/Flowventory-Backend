@@ -18,7 +18,7 @@ function round2(value) {
     return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
-async function getNextPaymentNo(conn) {
+export async function getNextPaymentNo(conn) {
     const [rows] = await conn.query('SELECT payment_no FROM payment_out ORDER BY id DESC LIMIT 1');
     const today = new Date();
     const y = today.getFullYear();
@@ -302,6 +302,93 @@ router.post('/', async (req, res) => {
             return res.status(409).json({ error: 'Payment number already exists' });
         }
         return res.status(500).json({ error: 'Failed to record payment out' });
+    } finally {
+        conn.release();
+    }
+});
+
+// Delete (reverse) a payment out. Rolls back the linked bill's paid/balance
+// amounts and status so the ledger and payables stay consistent.
+router.delete('/:id', async (req, res) => {
+    const paymentId = Number(req.params.id);
+    if (!Number.isFinite(paymentId) || paymentId <= 0) {
+        return res.status(400).json({ error: 'valid payment id is required' });
+    }
+
+    const conn = await db.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [paymentRows] = await conn.query(
+            'SELECT id, payment_no, purchase_invoice_id, amount FROM payment_out WHERE id = ? FOR UPDATE',
+            [paymentId]
+        );
+        if (!paymentRows.length) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Payment not found' });
+        }
+
+        const payment = paymentRows[0];
+        let billAfter = null;
+
+        if (payment.purchase_invoice_id) {
+            const [billRows] = await conn.query(
+                'SELECT id, bill_no, total_amount, paid_amount, balance_amount, status FROM purchase_invoices WHERE id = ? FOR UPDATE',
+                [payment.purchase_invoice_id]
+            );
+
+            if (billRows.length) {
+                const bill = billRows[0];
+                // A cancelled bill stays cancelled; just remove the payment.
+                if (String(bill.status) !== 'cancelled') {
+                    const nextPaid = round2(Math.max(0, Number(bill.paid_amount || 0) - Number(payment.amount || 0)));
+                    const nextBalance = round2(Math.max(0, Number(bill.total_amount || 0) - nextPaid));
+                    let nextStatus = 'confirmed';
+                    if (nextBalance <= 0 && nextPaid > 0) {
+                        nextStatus = 'paid';
+                    } else if (nextPaid > 0) {
+                        nextStatus = 'partially_paid';
+                    }
+
+                    await conn.query('UPDATE purchase_invoices SET ? WHERE id = ?', [
+                        { paid_amount: nextPaid, balance_amount: nextBalance, status: nextStatus },
+                        bill.id,
+                    ]);
+
+                    billAfter = {
+                        id: bill.id,
+                        bill_no: bill.bill_no,
+                        paid_amount: nextPaid,
+                        balance_amount: nextBalance,
+                        status: nextStatus,
+                    };
+                }
+            }
+        }
+
+        await conn.query('DELETE FROM payment_out WHERE id = ?', [paymentId]);
+
+        if (req.user?.id) {
+            try {
+                await conn.query('INSERT INTO audit_logs SET ?', {
+                    user_id: req.user.id,
+                    action: 'delete_payment_out',
+                    details: JSON.stringify({
+                        payment_out_id: paymentId,
+                        payment_no: payment.payment_no,
+                        amount: Number(payment.amount || 0),
+                        purchase_invoice_id: payment.purchase_invoice_id,
+                    }),
+                });
+            } catch (_) {}
+        }
+
+        await conn.commit();
+        return res.json({ success: true, id: paymentId, bill: billAfter });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Payment Out delete error:', err);
+        return res.status(500).json({ error: 'Failed to delete payment out' });
     } finally {
         conn.release();
     }

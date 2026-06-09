@@ -20,6 +20,12 @@ function round2(value) {
     return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
+// A debit note is a purchase return: confirming it sends goods back out of stock.
+// Drafts and cancelled notes do not affect stock.
+function affectsStock(status) {
+    return status !== 'draft' && status !== 'cancelled';
+}
+
 async function getNextDebitNoteNo(conn) {
     const [rows] = await conn.query(
         "SELECT bill_no FROM purchase_invoices WHERE bill_no LIKE 'DN-%' ORDER BY id DESC LIMIT 1"
@@ -113,7 +119,7 @@ async function computeLines(conn, inputItems, supplyType) {
 }
 
 function summarizeTotals(lines, headerDiscountAmount, roundOff, paidAmount) {
-    const subtotal = round2(lines.reduce((sum, line) => sum + line.quantity * line.rate, 0));
+    const subtotal = round2(lines.reduce((sum, line) => sum + round2(line.quantity * line.rate), 0));
     const lineDiscountTotal = round2(lines.reduce((sum, line) => sum + line.discount_amount, 0));
     const taxableAmountBeforeHeader = round2(lines.reduce((sum, line) => sum + line.taxable_value, 0));
     const taxableAmount = round2(Math.max(0, taxableAmountBeforeHeader - headerDiscountAmount));
@@ -271,6 +277,7 @@ router.post('/', async (req, res) => {
             place_of_supply: placeOfSupply,
             subtotal: totals.subtotal,
             discount_amount: round2(totals.lineDiscountTotal + headerDiscountAmount),
+            header_discount_amount: round2(headerDiscountAmount),
             taxable_amount: totals.taxableAmount,
             cgst_amount: totals.cgstAmount,
             sgst_amount: totals.sgstAmount,
@@ -288,6 +295,15 @@ router.post('/', async (req, res) => {
                 purchase_invoice_id: result.insertId,
                 ...line,
             });
+        }
+
+        if (affectsStock(status)) {
+            for (const line of normalizedItems) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock - ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
         }
 
         await conn.commit();
@@ -366,6 +382,7 @@ router.put('/:id', async (req, res) => {
                 place_of_supply: placeOfSupply,
                 subtotal: totals.subtotal,
                 discount_amount: round2(totals.lineDiscountTotal + headerDiscountAmount),
+                header_discount_amount: round2(headerDiscountAmount),
                 taxable_amount: totals.taxableAmount,
                 cgst_amount: totals.cgstAmount,
                 sgst_amount: totals.sgstAmount,
@@ -388,6 +405,17 @@ router.put('/:id', async (req, res) => {
             });
         }
 
+        // Existing note was a draft (enforced above), so no stock was removed yet.
+        // Remove now if it is being confirmed.
+        if (affectsStock(status)) {
+            for (const line of normalizedItems) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock - ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
+        }
+
         await conn.commit();
         return res.json({ success: true, debitNoteId, debitNoteNo });
     } catch (err) {
@@ -395,6 +423,59 @@ router.put('/:id', async (req, res) => {
         console.error('Debit note update error:', err);
         if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Debit note number already exists' });
         return res.status(500).json({ error: 'Failed to update debit note' });
+    } finally {
+        conn.release();
+    }
+});
+
+// Cancel a debit note and reverse its stock impact.
+// A confirmed debit note removed stock, so cancelling adds it back.
+router.post('/:id/cancel', async (req, res) => {
+    const debitNoteId = Number(req.params.id);
+    if (!Number.isFinite(debitNoteId) || debitNoteId <= 0) {
+        return res.status(400).json({ error: 'valid debit note id is required' });
+    }
+
+    const conn = await db.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [rows] = await conn.query(
+            "SELECT id, bill_no, status FROM purchase_invoices WHERE id = ? AND bill_no LIKE 'DN-%' FOR UPDATE",
+            [debitNoteId]
+        );
+        if (!rows.length) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Debit note not found' });
+        }
+
+        const current = rows[0];
+        if (String(current.status) === 'cancelled') {
+            await conn.rollback();
+            return res.status(400).json({ error: 'Debit note is already cancelled' });
+        }
+
+        if (affectsStock(current.status)) {
+            const [lines] = await conn.query(
+                'SELECT item_id, quantity FROM purchase_invoice_items WHERE purchase_invoice_id = ?',
+                [debitNoteId]
+            );
+            for (const line of lines) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock + ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
+        }
+
+        await conn.query('UPDATE purchase_invoices SET status = ? WHERE id = ?', ['cancelled', debitNoteId]);
+
+        await conn.commit();
+        return res.json({ success: true, id: debitNoteId, status: 'cancelled' });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Debit note cancel error:', err);
+        return res.status(500).json({ error: 'Failed to cancel debit note' });
     } finally {
         conn.release();
     }

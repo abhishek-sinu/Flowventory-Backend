@@ -242,26 +242,64 @@ router.get('/', async (req, res) => {
     const whereSql = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     try {
+        // current_balance is computed live from confirmed transactions so it always
+        // matches the party ledger report (the stored column is not relied upon here).
+        // Signed convention: positive = receivable (customer owes us),
+        // negative = payable (we owe supplier).
         const [rows] = await db.query(
             `
             SELECT
-                id,
-                party_type,
-                name,
-                phone,
-                email,
-                gstin,
-                city,
-                state,
-                opening_balance,
-                balance_nature,
-                current_balance,
-                is_active,
-                created_at,
-                updated_at
-            FROM parties
-            ${whereSql}
-            ORDER BY updated_at DESC, id DESC
+                pr.id,
+                pr.party_type,
+                pr.name,
+                pr.phone,
+                pr.email,
+                pr.gstin,
+                pr.city,
+                pr.state,
+                pr.opening_balance,
+                pr.is_active,
+                pr.created_at,
+                pr.updated_at,
+                pr.balance_nature,
+                ABS(pr.signed_balance) AS current_balance,
+                CASE WHEN pr.signed_balance < 0 THEN 'payable' ELSE 'receivable' END AS balance_nature_live
+            FROM (
+                SELECT
+                    p.*,
+                    ROUND(
+                        (CASE WHEN p.balance_nature = 'payable' THEN -1 ELSE 1 END) * p.opening_balance
+                        + COALESCE((
+                            SELECT SUM(s.total_amount) FROM sales_invoices s
+                            WHERE s.party_id = p.id AND s.invoice_no LIKE 'SINV-%'
+                              AND s.status IN ('confirmed', 'partially_paid', 'paid')
+                        ), 0)
+                        - COALESCE((
+                            SELECT SUM(s.total_amount) FROM sales_invoices s
+                            WHERE s.party_id = p.id AND s.invoice_no LIKE 'CN-%'
+                              AND s.status IN ('confirmed', 'partially_paid', 'paid')
+                        ), 0)
+                        - COALESCE((
+                            SELECT SUM(b.total_amount) FROM purchase_invoices b
+                            WHERE b.party_id = p.id AND b.bill_no LIKE 'PINV-%'
+                              AND b.status IN ('confirmed', 'partially_paid', 'paid')
+                        ), 0)
+                        + COALESCE((
+                            SELECT SUM(b.total_amount) FROM purchase_invoices b
+                            WHERE b.party_id = p.id AND b.bill_no LIKE 'DN-%'
+                              AND b.status IN ('confirmed', 'partially_paid', 'paid')
+                        ), 0)
+                        - COALESCE((
+                            SELECT SUM(pi.amount) FROM payment_in pi WHERE pi.party_id = p.id
+                        ), 0)
+                        + COALESCE((
+                            SELECT SUM(po.amount) FROM payment_out po WHERE po.party_id = p.id
+                        ), 0)
+                    , 2) AS signed_balance
+                FROM parties p
+                ${whereSql}
+            ) pr
+            ORDER BY pr.updated_at DESC, pr.id DESC
             `,
             params
         );

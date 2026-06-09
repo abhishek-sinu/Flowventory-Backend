@@ -2,6 +2,7 @@ import express from 'express';
 import db from '../db.js';
 import PDFDocument from 'pdfkit';
 import { buildCompanyContext, renderDocument } from '../utils/pdfRenderer.js';
+import { getNextPaymentNo } from './paymentOut.js';
 
 const router = express.Router();
 
@@ -18,6 +19,12 @@ function normalizeText(value) {
 
 function round2(value) {
     return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
+// Stock is added only for bills that actually bring goods into inventory.
+// Drafts and cancelled bills do not affect stock.
+function increasesStock(status) {
+    return status !== 'draft' && status !== 'cancelled';
 }
 
 async function getNextBillNo(conn) {
@@ -333,7 +340,7 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: errors.join(', ') });
         }
 
-        const subtotal = round2(normalizedItems.reduce((sum, line) => sum + line.quantity * line.rate, 0));
+        const subtotal = round2(normalizedItems.reduce((sum, line) => sum + round2(line.quantity * line.rate), 0));
         const lineDiscountTotal = round2(normalizedItems.reduce((sum, line) => sum + line.discount_amount, 0));
         const taxableAmountBeforeHeader = round2(normalizedItems.reduce((sum, line) => sum + line.taxable_value, 0));
         const taxableAmount = round2(Math.max(0, taxableAmountBeforeHeader - headerDiscountAmount));
@@ -354,6 +361,7 @@ router.post('/', async (req, res) => {
             place_of_supply: placeOfSupply,
             subtotal,
             discount_amount: round2(lineDiscountTotal + headerDiscountAmount),
+            header_discount_amount: round2(headerDiscountAmount),
             taxable_amount: taxableAmount,
             cgst_amount: cgstAmount,
             sgst_amount: sgstAmount,
@@ -370,6 +378,32 @@ router.post('/', async (req, res) => {
             await conn.query('INSERT INTO purchase_invoice_items SET ?', {
                 purchase_invoice_id: billResult.insertId,
                 ...line,
+            });
+        }
+
+        if (increasesStock(status)) {
+            for (const line of normalizedItems) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock + ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
+        }
+
+        // If the bill is created with an upfront paid amount, record a matching
+        // Payment Out so the party ledger and payables stay consistent.
+        // Only for booked purchase bills (PINV-, not draft/cancelled/debit note).
+        if (paidAmount > 0 && increasesStock(status) && String(billNo).startsWith('PINV-')) {
+            const paymentNo = await getNextPaymentNo(conn);
+            await conn.query('INSERT INTO payment_out SET ?', {
+                payment_no: paymentNo,
+                party_id: partyId,
+                purchase_invoice_id: billResult.insertId,
+                payment_date: billDate,
+                amount: round2(paidAmount),
+                payment_mode: 'cash',
+                reference_no: null,
+                notes: `Auto-recorded with bill ${billNo}`,
             });
         }
 
@@ -527,7 +561,7 @@ router.put('/:id', async (req, res) => {
             return res.status(400).json({ error: errors.join(', ') });
         }
 
-        const subtotal = round2(normalizedItems.reduce((sum, line) => sum + line.quantity * line.rate, 0));
+        const subtotal = round2(normalizedItems.reduce((sum, line) => sum + round2(line.quantity * line.rate), 0));
         const lineDiscountTotal = round2(normalizedItems.reduce((sum, line) => sum + line.discount_amount, 0));
         const taxableAmountBeforeHeader = round2(normalizedItems.reduce((sum, line) => sum + line.taxable_value, 0));
         const taxableAmount = round2(Math.max(0, taxableAmountBeforeHeader - headerDiscountAmount));
@@ -549,6 +583,7 @@ router.put('/:id', async (req, res) => {
                 place_of_supply: placeOfSupply,
                 subtotal,
                 discount_amount: round2(lineDiscountTotal + headerDiscountAmount),
+                header_discount_amount: round2(headerDiscountAmount),
                 taxable_amount: taxableAmount,
                 cgst_amount: cgstAmount,
                 sgst_amount: sgstAmount,
@@ -571,6 +606,17 @@ router.put('/:id', async (req, res) => {
             });
         }
 
+        // Existing bill was a draft (enforced above), so no stock was added yet.
+        // Add now if it is being confirmed.
+        if (increasesStock(status)) {
+            for (const line of normalizedItems) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock + ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
+        }
+
         await conn.commit();
         return res.json({ success: true, billId, billNo });
     } catch (err) {
@@ -580,6 +626,105 @@ router.put('/:id', async (req, res) => {
             return res.status(409).json({ error: 'Bill number already exists' });
         }
         return res.status(500).json({ error: 'Failed to update purchase bill' });
+    } finally {
+        conn.release();
+    }
+});
+
+// Cancel a purchase bill and reverse its stock impact.
+// A confirmed purchase added stock, so cancelling it removes that stock again.
+router.post('/:id/cancel', async (req, res) => {
+    const billId = Number(req.params.id);
+    if (!Number.isFinite(billId) || billId <= 0) {
+        return res.status(400).json({ error: 'valid bill id is required' });
+    }
+
+    const conn = await db.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [rows] = await conn.query(
+            'SELECT id, bill_no, status, paid_amount, balance_amount FROM purchase_invoices WHERE id = ? FOR UPDATE',
+            [billId]
+        );
+        if (!rows.length) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Purchase bill not found' });
+        }
+
+        const current = rows[0];
+        if (String(current.status) === 'cancelled') {
+            await conn.rollback();
+            return res.status(400).json({ error: 'Purchase bill is already cancelled' });
+        }
+
+        // Block cancellation if payments have been recorded against this bill.
+        // The user must delete those payments first so the ledger stays consistent.
+        const [paymentRows] = await conn.query(
+            'SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total FROM payment_out WHERE purchase_invoice_id = ?',
+            [billId]
+        );
+        if (Number(paymentRows[0]?.cnt || 0) > 0) {
+            await conn.rollback();
+            return res.status(409).json({
+                error: `Cannot cancel: ${paymentRows[0].cnt} payment(s) totalling ${Number(paymentRows[0].total).toFixed(2)} are linked to this bill. Delete the payment(s) first.`,
+            });
+        }
+
+        // Only reverse stock if the bill had actually added it.
+        if (increasesStock(current.status)) {
+            const [lines] = await conn.query(
+                'SELECT item_id, item_name, quantity FROM purchase_invoice_items WHERE purchase_invoice_id = ?',
+                [billId]
+            );
+
+            // Block cancellation if removing the purchased stock would make any
+            // item go negative (i.e. those goods have since been sold/consumed).
+            for (const line of lines) {
+                const [itemRows] = await conn.query(
+                    'SELECT current_stock FROM items WHERE id = ? FOR UPDATE',
+                    [line.item_id]
+                );
+                const stock = itemRows.length ? Number(itemRows[0].current_stock || 0) : 0;
+                if (stock - Number(line.quantity) < 0) {
+                    await conn.rollback();
+                    return res.status(400).json({
+                        error: `Cannot cancel: not enough stock to reverse for "${line.item_name}". Those goods may already be sold.`,
+                    });
+                }
+            }
+
+            for (const line of lines) {
+                await conn.query(
+                    'UPDATE items SET current_stock = current_stock - ? WHERE id = ?',
+                    [line.quantity, line.item_id]
+                );
+            }
+        }
+
+        await conn.query('UPDATE purchase_invoices SET status = ?, paid_amount = 0, balance_amount = 0 WHERE id = ?', ['cancelled', billId]);
+
+        if (req.user?.id) {
+            try {
+                await conn.query('INSERT INTO audit_logs SET ?', {
+                    user_id: req.user.id,
+                    action: 'cancel_purchase_bill',
+                    details: JSON.stringify({
+                        purchase_invoice_id: billId,
+                        bill_no: current.bill_no,
+                        previous_status: current.status,
+                        stock_reversed: increasesStock(current.status),
+                    }),
+                });
+            } catch (_) {}
+        }
+
+        await conn.commit();
+        return res.json({ success: true, id: billId, status: 'cancelled' });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Purchase cancel error:', err);
+        return res.status(500).json({ error: 'Failed to cancel purchase bill' });
     } finally {
         conn.release();
     }
