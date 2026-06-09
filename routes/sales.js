@@ -203,7 +203,7 @@ router.get('/:id/pdf', async (req, res) => {
         res.type('application/pdf');
 
         const company = await buildCompanyContext();
-        const doc = new PDFDocument({ margin: 40, size: 'A4' });
+        const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
         doc.pipe(res);
 
         renderDocument({
@@ -228,6 +228,7 @@ router.get('/:id/pdf', async (req, res) => {
             totals: invoice,
             totalLabel: 'Grand Total',
             payment: { paid: invoice.paid_amount, balance: invoice.balance_amount },
+            watermark: String(invoice.status) === 'cancelled' ? 'CANCELLED' : null,
         });
 
         return;

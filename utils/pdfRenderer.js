@@ -186,6 +186,28 @@ function numberToWords(n) {
 const money = (v) => Number(v || 0).toFixed(2);
 
 /**
+ * Stamp a large, semi-transparent diagonal watermark (e.g. "CANCELLED")
+ * across the current page. Drawn on top of content with low opacity so the
+ * underlying text stays readable.
+ */
+function stampWatermark(doc, text) {
+    const { width, height } = doc.page;
+    const label = String(text);
+    doc.save();
+    doc.rotate(-45, { origin: [width / 2, height / 2] });
+    doc.font('Helvetica-Bold').fontSize(110).fillColor('#EF4444').fillOpacity(0.12);
+    // Measure the text so it stays on a single line and is perfectly centered
+    // on the page's diagonal (avoids the last letter wrapping to a new line).
+    const textWidth = doc.widthOfString(label);
+    const textHeight = doc.currentLineHeight();
+    doc.text(label, width / 2 - textWidth / 2, height / 2 - textHeight / 2, {
+        lineBreak: false,
+        align: 'left',
+    });
+    doc.fillOpacity(1).restore();
+}
+
+/**
  * Render the branded company header (logo + company details + document title).
  * Returns the Y position to continue drawing below the header.
  */
@@ -280,7 +302,7 @@ function renderHeader(doc, company, { title, meta }) {
  * @param {object} [opts.payment]          optional { paid, balance }
  */
 export function renderDocument(opts) {
-    const { doc, company, title, meta, partyLabel, party, items, totals, totalLabel, payment } = opts;
+    const { doc, company, title, meta, partyLabel, party, items, totals, totalLabel, payment, watermark } = opts;
 
     let y = renderHeader(doc, company, { title, meta });
 
@@ -443,6 +465,26 @@ export function renderDocument(opts) {
         .text(`For ${company.company_name || 'Your Company'}`, boxX, signY, { width: boxW, align: 'center' });
     doc.moveTo(boxX + 40, signY + 40).lineTo(boxX + boxW - 40, signY + 40).stroke(THEME.line);
     doc.text('Authorized Signatory', boxX, signY + 44, { width: boxW, align: 'center' });
+
+    // Watermark (e.g. "CANCELLED") stamped on every page, drawn last so it
+    // overlays all content. Falls back to the current page if the document was
+    // not created with buffered pages.
+    if (watermark) {
+        let range = null;
+        try {
+            range = doc.bufferedPageRange();
+        } catch {
+            range = null;
+        }
+        if (range && range.count) {
+            for (let i = range.start; i < range.start + range.count; i += 1) {
+                doc.switchToPage(i);
+                stampWatermark(doc, watermark);
+            }
+        } else {
+            stampWatermark(doc, watermark);
+        }
+    }
 
     doc.end();
 }

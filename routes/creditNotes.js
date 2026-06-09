@@ -529,7 +529,7 @@ router.get('/:id/pdf', async (req, res) => {
         res.type('application/pdf');
 
         const company = await buildCompanyContext();
-        const doc = new PDFDocument({ margin: 40, size: 'A4' });
+        const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
         doc.pipe(res);
 
         renderDocument({
@@ -552,6 +552,7 @@ router.get('/:id/pdf', async (req, res) => {
             items: itemRows,
             totals: creditNote,
             totalLabel: 'Credit Total',
+            watermark: String(creditNote.status) === 'cancelled' ? 'CANCELLED' : null,
         });
     } catch (err) {
         console.error('Credit note pdf error:', err);
