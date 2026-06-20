@@ -1,15 +1,13 @@
 import express from 'express';
 import db from '../db.js';
+import multer from 'multer';
+import XLSX from 'xlsx';
 import PDFDocument from 'pdfkit';
 import { buildCompanyContext, renderDocument } from '../utils/pdfRenderer.js';
 import { getNextPaymentNo } from './paymentOut.js';
 
 const router = express.Router();
-
-function toNumber(value, fallback = 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-}
+const upload = multer({ storage: multer.memoryStorage() });
 
 function normalizeText(value) {
     if (value === undefined || value === null) return null;
@@ -17,8 +15,32 @@ function normalizeText(value) {
     return txt.length ? txt : null;
 }
 
+function pickValue(row, keys) {
+    for (const key of keys) {
+        if (row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== '') {
+            return row[key];
+        }
+    }
+    return undefined;
+}
+
+function toNumber(value, fallback = 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function round2(value) {
     return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
+function normalizeDateFields(row) {
+    const normalized = { ...row };
+    Object.keys(normalized).forEach((key) => {
+        if ((key.includes('date') || key === 'created_at') && normalized[key]) {
+            normalized[key] = new Date(normalized[key]).toISOString().slice(0, 10);
+        }
+    });
+    return normalized;
 }
 
 // Stock is added only for bills that actually bring goods into inventory.
@@ -46,6 +68,9 @@ async function getNextBillNo(conn) {
 
 router.get('/', async (req, res) => {
     const { q, status } = req.query;
+    const page = Math.max(1, toNumber(req.query.page, 1));
+    const limit = Math.min(100, Math.max(1, toNumber(req.query.limit, 20)));
+    const offset = (page - 1) * limit;
     const conditions = [];
     const params = [];
 
@@ -63,6 +88,13 @@ router.get('/', async (req, res) => {
     const whereSql = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     try {
+        const [countRows] = await db.query(
+            `SELECT COUNT(*) AS total FROM purchase_invoices piv JOIN parties p ON p.id = piv.party_id ${whereSql}`,
+            params
+        );
+        const total = Number(countRows[0]?.total || 0);
+        const totalPages = Math.max(1, Math.ceil(total / limit));
+
         const [rows] = await db.query(
             `
             SELECT
@@ -81,11 +113,20 @@ router.get('/', async (req, res) => {
             JOIN parties p ON p.id = piv.party_id
             ${whereSql}
             ORDER BY piv.bill_date DESC, piv.id DESC
+            LIMIT ? OFFSET ?
             `,
-            params
+            [...params, limit, offset]
         );
 
-        return res.json(rows);
+        return res.json({
+            data: rows,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages,
+            },
+        });
     } catch (err) {
         console.error('Purchase list error:', err);
         return res.status(500).json({ error: 'Failed to fetch purchase bills' });
@@ -100,6 +141,419 @@ router.get('/next-bill-no', async (_req, res) => {
     } catch (err) {
         console.error('Next bill no error:', err);
         return res.status(500).json({ error: 'Failed to generate bill number' });
+    } finally {
+        conn.release();
+    }
+});
+
+router.get('/template', async (_req, res) => {
+    try {
+        const templateRows = [
+            {
+                bill_no: 'PINV-20260620-001',
+                bill_date: '2026-06-20',
+                due_date: '2026-06-30',
+                party_gstin: '27ABCDE1234F1Z5',
+                party_name: 'ABC Traders',
+                place_of_supply: 'Maharashtra',
+                supply_type: 'intra',
+                status: 'confirmed',
+                discount_amount: 0,
+                round_off: 0,
+                notes: 'Sample purchase bill',
+                paid_amount: 0,
+                item_sku: 'FMCG-PARLE-100G',
+                quantity: 10,
+                rate: 20,
+                discount_percent: 0,
+                gst_percent: 18,
+            },
+        ];
+
+        const ws = XLSX.utils.json_to_sheet(templateRows);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'purchase_import_template');
+
+        const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        res.setHeader('Content-Disposition', 'attachment; filename="purchase_import_template.xlsx"');
+        res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        return res.send(buffer);
+    } catch (err) {
+        console.error('Purchase template error:', err);
+        return res.status(500).json({ error: 'Failed to generate template' });
+    }
+});
+
+router.get('/xls', async (req, res) => {
+    const { q, status } = req.query;
+    const conditions = [];
+    const params = [];
+
+    if (q) {
+        const pattern = `%${String(q).trim()}%`;
+        conditions.push('(piv.bill_no LIKE ? OR p.name LIKE ? OR pii.item_name LIKE ? OR pii.item_id LIKE ?)');
+        params.push(pattern, pattern, pattern, pattern);
+    }
+
+    if (status) {
+        conditions.push('piv.status = ?');
+        params.push(String(status));
+    }
+
+    const whereSql = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    try {
+        const [rows] = await db.query(
+            `
+            SELECT
+                piv.bill_no,
+                piv.bill_date,
+                piv.due_date,
+                piv.place_of_supply,
+                piv.status,
+                piv.subtotal,
+                piv.discount_amount,
+                piv.header_discount_amount,
+                piv.taxable_amount,
+                piv.cgst_amount,
+                piv.sgst_amount,
+                piv.igst_amount,
+                piv.round_off,
+                piv.total_amount,
+                piv.paid_amount,
+                piv.balance_amount,
+                piv.notes,
+                p.name AS party_name,
+                p.gstin AS party_gstin,
+                p.phone AS party_phone,
+                pii.item_id,
+                pii.item_name,
+                pii.hsn_code,
+                pii.quantity,
+                pii.unit,
+                pii.rate,
+                pii.discount_percent,
+                pii.discount_amount AS line_discount_amount,
+                pii.taxable_value,
+                pii.gst_percent,
+                pii.cgst_amount AS line_cgst_amount,
+                pii.sgst_amount AS line_sgst_amount,
+                pii.igst_amount AS line_igst_amount,
+                pii.line_total
+            FROM purchase_invoices piv
+            JOIN parties p ON p.id = piv.party_id
+            JOIN purchase_invoice_items pii ON pii.purchase_invoice_id = piv.id
+            ${whereSql}
+            ORDER BY piv.bill_date DESC, piv.id DESC, pii.id ASC
+            `,
+            params
+        );
+
+        const cleaned = rows.map(normalizeDateFields);
+        const ws = XLSX.utils.json_to_sheet(cleaned);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'purchase_export');
+
+        const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        res.setHeader('Content-Disposition', `attachment; filename="purchase_export.xlsx"`);
+        res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        return res.send(buffer);
+    } catch (err) {
+        console.error('Purchase export error:', err);
+        return res.status(500).json({ error: 'Failed to export purchase data' });
+    }
+});
+
+router.post('/import', upload.single('file'), async (req, res) => {
+    if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ error: 'Please upload an .xls or .xlsx file' });
+    }
+
+    const originalName = String(req.file.originalname || '').toLowerCase();
+    if (!originalName.endsWith('.xls') && !originalName.endsWith('.xlsx')) {
+        return res.status(400).json({ error: 'Only .xls or .xlsx files are supported' });
+    }
+
+    let workbook;
+    try {
+        workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+    } catch (err) {
+        console.error('Purchase import read error:', err);
+        return res.status(400).json({ error: 'Invalid excel file format' });
+    }
+
+    const sheetName = workbook.SheetNames[0];
+    if (!sheetName) {
+        return res.status(400).json({ error: 'Excel file has no sheets' });
+    }
+
+    const sheet = workbook.Sheets[sheetName];
+    const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+    if (!rawRows.length) {
+        return res.status(400).json({ error: 'Excel file has no data rows' });
+    }
+
+    const failed = [];
+    const groups = new Map();
+    const seenBillNos = new Set();
+
+    for (let index = 0; index < rawRows.length; index += 1) {
+        const rowNumber = index + 2;
+        const row = rawRows[index];
+        const billNoRaw = pickValue(row, ['bill_no', 'Bill No', 'bill no']);
+        const billDate = normalizeText(pickValue(row, ['bill_date', 'Bill Date', 'bill date']));
+        const dueDate = normalizeText(pickValue(row, ['due_date', 'Due Date', 'due date']));
+        const partyGstin = normalizeText(pickValue(row, ['party_gstin', 'GSTIN', 'gstin', 'Party GSTIN', 'Party Gstin']));
+        const partyName = normalizeText(pickValue(row, ['party_name', 'Party Name', 'party name']));
+        const placeOfSupply = normalizeText(pickValue(row, ['place_of_supply', 'place of supply', 'Place of Supply']));
+        const status = normalizeText(pickValue(row, ['status', 'Status'])) || 'confirmed';
+        const supplyType = normalizeText(pickValue(row, ['supply_type', 'supply type', 'Supply Type'])) || 'intra';
+        const headerDiscountAmount = toNumber(pickValue(row, ['discount_amount', 'discount amount', 'Discount Amount']), 0);
+        const roundOff = toNumber(pickValue(row, ['round_off', 'round off', 'Round Off']), 0);
+        const notes = normalizeText(pickValue(row, ['notes', 'Notes']));
+        const paidAmount = toNumber(pickValue(row, ['paid_amount', 'paid amount', 'Paid Amount']), 0);
+        const itemSku = normalizeText(pickValue(row, ['item_sku', 'item sku', 'sku', 'SKU']));
+        const itemName = normalizeText(pickValue(row, ['item_name', 'Item Name', 'item name']));
+        const quantity = toNumber(pickValue(row, ['quantity', 'Quantity']), 0);
+        const rate = toNumber(pickValue(row, ['rate', 'Rate']), 0);
+        const discountPercent = toNumber(pickValue(row, ['discount_percent', 'discount percent', 'Discount Percent', 'Discount %']), 0);
+        const gstPercent = toNumber(pickValue(row, ['gst_percent', 'gst percent', 'GST Percent', 'GST %']), 0);
+
+        const billNo = normalizeText(billNoRaw) || null;
+        const groupKey = billNo || `__ROW_${index + 1}`;
+
+        if (!billDate) {
+            failed.push({ row: rowNumber, bill_no: billNo, reason: 'bill_date is required' });
+            continue;
+        }
+
+        if (!partyGstin && !partyName) {
+            failed.push({ row: rowNumber, bill_no: billNo, reason: 'party_gstin or party_name is required' });
+            continue;
+        }
+
+        if (!itemSku && !itemName) {
+            failed.push({ row: rowNumber, bill_no: billNo, reason: 'item_sku or item_name is required' });
+            continue;
+        }
+
+        if (!Number.isFinite(quantity) || quantity <= 0) {
+            failed.push({ row: rowNumber, bill_no: billNo, reason: 'quantity must be a positive number' });
+            continue;
+        }
+
+        if (String(status) !== 'confirmed' && String(status) !== 'draft') {
+            failed.push({ row: rowNumber, bill_no: billNo, reason: 'status must be confirmed or draft' });
+            continue;
+        }
+
+        if (!['intra', 'inter'].includes(String(supplyType))) {
+            failed.push({ row: rowNumber, bill_no: billNo, reason: 'supply_type must be intra or inter' });
+            continue;
+        }
+
+        if (!groups.has(groupKey)) {
+            groups.set(groupKey, {
+                bill_no: billNo,
+                bill_date: billDate,
+                due_date: dueDate,
+                party_gstin: partyGstin,
+                party_name: partyName,
+                place_of_supply: placeOfSupply,
+                status: String(status),
+                supply_type: String(supplyType),
+                discount_amount: headerDiscountAmount,
+                round_off: roundOff,
+                notes,
+                paid_amount: paidAmount,
+                lines: [],
+            });
+        }
+
+        const group = groups.get(groupKey);
+        if (group) {
+            group.lines.push({
+                item_sku: itemSku,
+                item_name: itemName,
+                quantity,
+                rate,
+                discount_percent: discountPercent,
+                gst_percent: gstPercent,
+                rowNumber,
+            });
+        }
+    }
+
+    if (failed.length) {
+        return res.status(400).json({ success: false, summary: { totalRows: rawRows.length, created: 0, updated: 0, failedCount: failed.length, failed } });
+    }
+
+    const conn = await db.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        let created = 0;
+        const successful = [];
+
+        for (const [, group] of groups) {
+            const partyWhere = group.party_gstin ? 'gstin = ?' : 'name = ?';
+            const partyParam = group.party_gstin ? group.party_gstin : group.party_name;
+            const [partyRows] = await conn.query(`SELECT id FROM parties WHERE ${partyWhere} LIMIT 1`, [partyParam]);
+            if (!partyRows.length) {
+                failed.push({ bill_no: group.bill_no, reason: 'party not found by GSTIN or name' });
+                continue;
+            }
+            const partyId = partyRows[0].id;
+
+            if (group.bill_no) {
+                const [existing] = await conn.query('SELECT id FROM purchase_invoices WHERE bill_no = ? LIMIT 1', [group.bill_no]);
+                if (existing.length) {
+                    failed.push({ bill_no: group.bill_no, reason: 'bill_no already exists' });
+                    continue;
+                }
+            }
+
+            const normalizedItems = [];
+            const validationErrors = [];
+            for (const line of group.lines) {
+                const [itemRows] = await conn.query(
+                    'SELECT id, name, hsn_code, unit, purchase_price, gst_percent FROM items WHERE sku = ? OR name = ? LIMIT 1',
+                    [line.item_sku, line.item_name]
+                );
+                if (!itemRows.length) {
+                    validationErrors.push(`item not found for sku ${line.item_sku || ''} / name ${line.item_name || ''}`);
+                    continue;
+                }
+                const item = itemRows[0];
+                const lineRate = toNumber(line.rate, Number(item.purchase_price || 0));
+                const gstPercent = toNumber(line.gst_percent, Number(item.gst_percent || 0));
+                const discountPercent = toNumber(line.discount_percent, 0);
+                const lineBase = round2(line.quantity * lineRate);
+                const discountAmount = round2((lineBase * discountPercent) / 100);
+                const taxable = round2(lineBase - discountAmount);
+                const gstAmount = round2((taxable * gstPercent) / 100);
+                let cgst = 0;
+                let sgst = 0;
+                let igst = 0;
+                if (group.supply_type === 'inter') {
+                    igst = gstAmount;
+                } else {
+                    cgst = round2(gstAmount / 2);
+                    sgst = round2(gstAmount - cgst);
+                }
+                normalizedItems.push({
+                    item_id: item.id,
+                    item_name: item.name,
+                    hsn_code: item.hsn_code,
+                    quantity: line.quantity,
+                    unit: item.unit || 'pcs',
+                    rate: lineRate,
+                    discount_percent: discountPercent,
+                    discount_amount: discountAmount,
+                    taxable_value: taxable,
+                    gst_percent: gstPercent,
+                    cgst_amount: cgst,
+                    sgst_amount: sgst,
+                    igst_amount: igst,
+                    line_total: round2(taxable + cgst + sgst + igst),
+                });
+            }
+
+            if (validationErrors.length) {
+                failed.push({ bill_no: group.bill_no, reason: validationErrors.join('; ') });
+                continue;
+            }
+
+            const subtotal = round2(normalizedItems.reduce((sum, line) => sum + round2(line.quantity * line.rate), 0));
+            const lineDiscountTotal = round2(normalizedItems.reduce((sum, line) => sum + line.discount_amount, 0));
+            const taxableAmountBeforeHeader = round2(normalizedItems.reduce((sum, line) => sum + line.taxable_value, 0));
+            const taxableAmount = round2(Math.max(0, taxableAmountBeforeHeader - group.discount_amount));
+            const cgstAmount = round2(normalizedItems.reduce((sum, line) => sum + line.cgst_amount, 0));
+            const sgstAmount = round2(normalizedItems.reduce((sum, line) => sum + line.sgst_amount, 0));
+            const igstAmount = round2(normalizedItems.reduce((sum, line) => sum + line.igst_amount, 0));
+            const totalAmount = round2(taxableAmount + cgstAmount + sgstAmount + igstAmount + group.round_off);
+            const balanceAmount = round2(Math.max(0, totalAmount - group.paid_amount));
+            const billNo = group.bill_no || await getNextBillNo(conn);
+
+            const [billResult] = await conn.query('INSERT INTO purchase_invoices SET ?', {
+                bill_no: billNo,
+                party_id: partyId,
+                bill_date: group.bill_date,
+                due_date: group.due_date,
+                place_of_supply: group.place_of_supply,
+                subtotal,
+                discount_amount: round2(lineDiscountTotal + group.discount_amount),
+                header_discount_amount: round2(group.discount_amount),
+                taxable_amount: taxableAmount,
+                cgst_amount: cgstAmount,
+                sgst_amount: sgstAmount,
+                igst_amount: igstAmount,
+                round_off: group.round_off,
+                total_amount: totalAmount,
+                paid_amount: group.paid_amount,
+                balance_amount: balanceAmount,
+                status: group.status,
+                notes: group.notes,
+            });
+
+            for (const line of normalizedItems) {
+                await conn.query('INSERT INTO purchase_invoice_items SET ?', {
+                    purchase_invoice_id: billResult.insertId,
+                    ...line,
+                });
+            }
+
+            if (group.status === 'confirmed') {
+                for (const line of normalizedItems) {
+                    await conn.query('UPDATE items SET current_stock = current_stock + ? WHERE id = ?', [line.quantity, line.item_id]);
+                }
+            }
+
+            if (group.paid_amount > 0 && group.status === 'confirmed' && String(billNo).startsWith('PINV-')) {
+                const paymentNo = await getNextPaymentNo(conn);
+                await conn.query('INSERT INTO payment_out SET ?', {
+                    payment_no: paymentNo,
+                    party_id: partyId,
+                    purchase_invoice_id: billResult.insertId,
+                    payment_date: group.bill_date,
+                    amount: round2(group.paid_amount),
+                    payment_mode: 'cash',
+                    reference_no: null,
+                    notes: `Auto-recorded with bill ${billNo}`,
+                });
+            }
+
+            created += 1;
+            successful.push(billNo);
+        }
+
+        if (req.user?.id) {
+            try {
+                await conn.query('INSERT INTO audit_logs SET ?', {
+                    user_id: req.user.id,
+                    action: 'import_purchase_bills_xls',
+                    details: JSON.stringify({ created, failedCount: failed.length, failed }),
+                });
+            } catch (_) {}
+        }
+
+        await conn.commit();
+
+        return res.json({
+            success: true,
+            summary: {
+                totalRows: rawRows.length,
+                created,
+                updated: 0,
+                failedCount: failed.length,
+                failed,
+                importedBillNos: successful,
+            },
+        });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Purchase import error:', err);
+        return res.status(500).json({ error: 'Failed to import purchase bills' });
     } finally {
         conn.release();
     }
